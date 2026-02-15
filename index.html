@@ -156,7 +156,9 @@
       showAuthModal: false,
       showModelModal: false,
       loading: false,
-      statusMessage: ''
+      statusMessage: '',
+      googleOAuthPending: false,
+      googleOAuthError: ''
     };
 
     async function loadConfigs() {
@@ -170,7 +172,8 @@
               ...p,
               connected: !!config.hasKey,
               apiKey: '',
-              defaultModel: config.defaultModel || ''
+              defaultModel: config.defaultModel || '',
+              oauthEmail: config.authMethod === 'oauth' ? (config.apiKey || '') : ''
             };
           });
           renderApp();
@@ -201,34 +204,58 @@
     }
 
     function ProviderCard({ provider }) {
+      const isGoogleOAuth = provider.id === 'google';
       return (
         <div class={`provider-card rounded-xl p-6 ${provider.connected ? 'status-connected' : 'status-disconnected'} shadow-lg`}>
           <div class="flex items-start justify-between mb-4">
             <div class="text-4xl">{provider.icon}</div>
             <span class={`px-3 py-1 rounded-full text-xs font-semibold ${provider.connected ? 'bg-green-500/20 text-green-300' : 'bg-gray-500/20 text-gray-300'}`}>
-              {provider.connected ? '✓ Connected' : '○ Not Connected'}
+              {provider.connected ? '&#10003; Connected' : '&#9675; Not Connected'}
             </span>
           </div>
-          
+
           <h3 class="text-xl font-bold text-white mb-2">{provider.name}</h3>
           <p class="text-sm text-gray-300 mb-4">{provider.description}</p>
-          
-          {provider.connected && provider.defaultModel && (
+
+          {provider.connected && provider.oauthEmail && (
+            <div class="mb-4 p-3 bg-black/20 rounded-lg">
+              <p class="text-xs text-gray-400">Signed in as</p>
+              <p class="text-sm font-mono text-white truncate">{provider.oauthEmail}</p>
+            </div>
+          )}
+
+          {provider.connected && provider.defaultModel && !provider.oauthEmail && (
             <div class="mb-4 p-3 bg-black/20 rounded-lg">
               <p class="text-xs text-gray-400">Default Model</p>
               <p class="text-sm font-mono text-white truncate">{provider.defaultModel}</p>
             </div>
           )}
-          
+
+          {state.googleOAuthError && isGoogleOAuth && (
+            <div class="mb-4 p-2 bg-red-900/30 rounded-lg">
+              <p class="text-xs text-red-300">{state.googleOAuthError}</p>
+            </div>
+          )}
+
           <div class="flex gap-2">
-            <button 
-              class="flex-1 btn btn-sm btn-primary"
-              onClick={() => openAuth(provider)}
-            >
-              {provider.connected ? 'Re-authenticate' : 'Connect'}
-            </button>
-            {provider.connected && (
-              <button 
+            {isGoogleOAuth ? (
+              <button
+                class="flex-1 btn btn-sm btn-primary"
+                onClick={() => startGoogleOAuth()}
+                disabled={state.googleOAuthPending}
+              >
+                {state.googleOAuthPending ? 'Waiting for Google...' : (provider.connected ? 'Re-authenticate' : 'Sign in with Google')}
+              </button>
+            ) : (
+              <button
+                class="flex-1 btn btn-sm btn-primary"
+                onClick={() => openAuth(provider)}
+              >
+                {provider.connected ? 'Re-authenticate' : 'Connect'}
+              </button>
+            )}
+            {provider.connected && !isGoogleOAuth && (
+              <button
                 class="flex-1 btn btn-sm btn-secondary"
                 onClick={() => openModelSelector(provider)}
               >
@@ -369,6 +396,53 @@
       state.selectedProvider = provider;
       state.showModelModal = true;
       renderApp();
+    }
+
+    async function startGoogleOAuth() {
+      state.googleOAuthPending = true;
+      state.googleOAuthError = '';
+      renderApp();
+
+      try {
+        const response = await fetch('/api/google-oauth/start', { method: 'POST' });
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.error || 'Failed to start OAuth');
+        }
+        const { authUrl } = await response.json();
+        window.open(authUrl, '_blank');
+
+        const pollInterval = setInterval(async () => {
+          try {
+            const statusRes = await fetch('/api/google-oauth/status');
+            const status = await statusRes.json();
+            if (status.status === 'success') {
+              clearInterval(pollInterval);
+              state.googleOAuthPending = false;
+              state.googleOAuthError = '';
+              loadConfigs();
+            } else if (status.status === 'error') {
+              clearInterval(pollInterval);
+              state.googleOAuthPending = false;
+              state.googleOAuthError = status.error || 'Authentication failed';
+              renderApp();
+            }
+          } catch (_) {}
+        }, 1500);
+
+        setTimeout(() => {
+          clearInterval(pollInterval);
+          if (state.googleOAuthPending) {
+            state.googleOAuthPending = false;
+            state.googleOAuthError = 'Authentication timed out';
+            renderApp();
+          }
+        }, 5 * 60 * 1000);
+      } catch (e) {
+        state.googleOAuthPending = false;
+        state.googleOAuthError = e.message;
+        renderApp();
+      }
     }
 
     async function saveAuth(provider) {
