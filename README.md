@@ -1,6 +1,6 @@
-# Agent Auth 🤖
+# Agent Auth
 
-Universal OAuth Authenticator for AI Agents - a buildless web application using WebJSX and Ripple-UI.
+Universal Credential Manager for AI Agents - a buildless web application using WebJSX and Ripple-UI.
 
 ## Supported Providers
 
@@ -20,7 +20,7 @@ Universal OAuth Authenticator for AI Agents - a buildless web application using 
 npm start
 ```
 
-Then open http://localhost:3000 in your browser.
+Then open http://localhost:8765 in your browser.
 
 ## Usage
 
@@ -42,6 +42,15 @@ Configs are stored in your home directory:
 - `~/.claude/max.json` - Claude Code Max
 - `~/.opencode/config.json` - OpenCode
 - `~/.proxypilot/config.json` - ProxyPilot
+
+## Security
+
+- Server binds to localhost (127.0.0.1) by default
+- CORS restricted to localhost origins only
+- API keys are masked in GET responses (only last 4 characters shown)
+- Config files are written with 0600 permissions (owner-only)
+- Request body size limited to 1MB
+- All inputs validated before processing
 
 ## Tech Stack
 

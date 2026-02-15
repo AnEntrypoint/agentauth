@@ -1,12 +1,25 @@
 {
   "name": "agent-auth",
   "version": "1.0.0",
-  "description": "Universal OAuth Authenticator for AI Agents",
+  "description": "Universal Credential Manager for AI Agents",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
-  "keywords": ["oauth", "ai", "authenticator", "claude", "openai", "gemini"],
+  "files": [
+    "server.js",
+    "index.html",
+    "README.md"
+  ],
+  "keywords": ["oauth", "ai", "authenticator", "claude", "openai", "gemini", "credentials"],
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "license": "MIT"
 }

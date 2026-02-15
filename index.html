@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Agent Auth - Universal OAuth Authenticator</title>
+  <title>Agent Auth - Universal Credential Manager</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rippleui@1.12.1/dist/css/styles.css">
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
@@ -168,8 +168,8 @@
             const config = configs[p.id] || {};
             return {
               ...p,
-              connected: !!config.apiKey,
-              apiKey: config.apiKey || '',
+              connected: !!config.hasKey,
+              apiKey: '',
               defaultModel: config.defaultModel || ''
             };
           });
@@ -185,7 +185,7 @@
         <div class="container mx-auto px-4 py-8 max-w-6xl">
           <header class="text-center mb-12">
             <h1 class="text-4xl font-bold text-white mb-2">🤖 Agent Auth</h1>
-            <p class="text-gray-400">Universal OAuth Authenticator for AI Agents</p>
+            <p class="text-gray-400">Universal Credential Manager for AI Agents</p>
           </header>
 
           <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -401,17 +401,9 @@
           renderApp();
         }
       } catch (e) {
-        const idx = state.providers.findIndex(p => p.id === provider.id);
-        if (idx !== -1) {
-          state.providers[idx].connected = true;
-          if (!state.providers[idx].defaultModel) {
-            state.providers[idx].defaultModel = provider.models[0];
-          }
-        }
-        state.showAuthModal = false;
-        state.statusMessage = `Demo: Would save config for ${provider.name}`;
+        state.statusMessage = `Error saving config for ${provider.name}: ${e.message}`;
         renderApp();
-        setTimeout(() => { state.statusMessage = ''; renderApp(); }, 3000);
+        setTimeout(() => { state.statusMessage = ''; renderApp(); }, 5000);
       }
     }
 
