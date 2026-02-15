@@ -1,0 +1,12 @@
+{
+  "name": "agent-auth",
+  "version": "1.0.0",
+  "description": "Universal OAuth Authenticator for AI Agents",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": ["oauth", "ai", "authenticator", "claude", "openai", "gemini"],
+  "license": "MIT"
+}

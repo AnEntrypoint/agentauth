@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agent Auth - Universal OAuth Authenticator</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/rippleui@1.12.1/dist/css/styles.css">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .provider-card { transition: all 0.2s ease; }
+    .provider-card:hover { transform: translateY(-2px); }
+    .status-connected { background: linear-gradient(135deg, #10b981 0%, #059669 100%); }
+    .status-disconnected { background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%); }
+  </style>
+</head>
+<body class="bg-gray-900 min-h-screen">
+  <div id="app"></div>
+  
+  <script type="importmap">
+  {
+    "imports": {
+      "webjsx": "https://esm.sh/webjsx@0.2.1",
+      "webjsx/jsx-runtime": "https://esm.sh/webjsx@0.2.1/jsx-runtime"
+    }
+  }
+  </script>
+  
+  <script type="module">
+    import * as webjsx from 'webjsx';
+    const { h, render } = webjsx;
+
+    const PROVIDERS = [
+      {
+        id: 'anthropic',
+        name: 'Claude Code / Anthropic',
+        icon: '🤖',
+        description: 'Anthropic API for Claude AI',
+        configPaths: [
+          '~/.claude.json',
+          '~/.config/claude/settings.json',
+          '~/.anthropic.json'
+        ],
+        models: ['claude-opus-4-5-20251120', 'claude-sonnet-4-20250514', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-haiku-20240307'],
+        authType: 'api-key',
+        authUrl: 'https://console.anthropic.com/'
+      },
+      {
+        id: 'openai',
+        name: 'OpenAI',
+        icon: '🧠',
+        description: 'GPT models via OpenAI',
+        configPaths: [
+          '~/.openai.json',
+          '~/.config/openai/api-key'
+        ],
+        models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4', 'gpt-3.5-turbo'],
+        authType: 'api-key',
+        authUrl: 'https://platform.openai.com/api-keys'
+      },
+      {
+        id: 'google',
+        name: 'Google Gemini',
+        icon: '🔵',
+        description: 'Gemini CLI and Gemini API',
+        configPaths: [
+          '~/.gemini.json',
+          '~/.config/gemini/credentials.json'
+        ],
+        models: ['gemini-2.0-flash-exp', 'gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-1.5-flash-8b'],
+        authType: 'oauth',
+        authUrl: 'https://aistudio.google.com/app/apikey'
+      },
+      {
+        id: 'openrouter',
+        name: 'OpenRouter',
+        icon: '🌐',
+        description: 'Unified access to multiple LLM providers',
+        configPaths: [
+          '~/.openrouter.json',
+          '~/.config/openrouter/config.json'
+        ],
+        models: ['anthropic/claude-3.5-sonnet', 'openai/gpt-4o', 'google/gemini-pro-1.5', 'meta-llama/llama-3.1-405b-instruct'],
+        authType: 'api-key',
+        authUrl: 'https://openrouter.ai/settings'
+      },
+      {
+        id: 'github',
+        name: 'GitHub Models',
+        icon: '🐙',
+        description: 'GitHub Copilot and Models',
+        configPaths: [
+          '~/.github.json',
+          '~/.config/github-copilot.json'
+        ],
+        models: ['gpt-4o', 'gpt-4o-mini', 'claude-3.5-sonnet'],
+        authType: 'oauth',
+        authUrl: 'https://github.com/settings/tokens'
+      },
+      {
+        id: 'azure',
+        name: 'Azure OpenAI',
+        icon: '☁️',
+        description: 'Microsoft Azure OpenAI Service',
+        configPaths: [
+          '~/.azure.json',
+          '~/.config/azure-openai/config.json'
+        ],
+        models: ['gpt-4o', 'gpt-4-turbo', 'gpt-35-turbo'],
+        authType: 'api-key',
+        authUrl: 'https://portal.azure.com/'
+      },
+      {
+        id: 'anthropic-claude-code',
+        name: 'Claude Code Max',
+        icon: '⚡',
+        description: 'Claude Code with Max plan',
+        configPaths: [
+          '~/.claude/max.json',
+          '~/.config/claude-code/max.json'
+        ],
+        models: ['claude-opus-4-5-20251120', 'claude-sonnet-4-20250514', 'claude-3.5-sonnet-20241022'],
+        authType: 'oauth',
+        authUrl: 'https://claude.com/code'
+      },
+      {
+        id: 'opencode',
+        name: 'OpenCode',
+        icon: '💻',
+        description: 'OpenCode CLI authentication',
+        configPaths: [
+          '~/.opencode/config.json',
+          '~/.config/opencode/config.json'
+        ],
+        models: ['claude-sonnet-4-20250514', 'gpt-4o', 'gemini-1.5-pro'],
+        authType: 'oauth',
+        authUrl: 'https://opencode.ai/'
+      },
+      {
+        id: 'proxypilot',
+        name: 'ProxyPilot',
+        icon: '✈️',
+        description: 'ProxyPilot providers',
+        configPaths: [
+          '~/.proxypilot/config.json',
+          '~/.config/proxypilot/config.json'
+        ],
+        models: ['claude-3.5-sonnet', 'gpt-4o', 'gemini-1.5-pro'],
+        authType: 'api-key',
+        authUrl: 'https://proxypilot.io/'
+      }
+    ];
+
+    let state = {
+      providers: PROVIDERS.map(p => ({ ...p, connected: false, apiKey: '', defaultModel: '' })),
+      selectedProvider: null,
+      showAuthModal: false,
+      showModelModal: false,
+      loading: false,
+      statusMessage: ''
+    };
+
+    async function loadConfigs() {
+      try {
+        const response = await fetch('/api/configs');
+        if (response.ok) {
+          const configs = await response.json();
+          state.providers = state.providers.map(p => {
+            const config = configs[p.id] || {};
+            return {
+              ...p,
+              connected: !!config.apiKey,
+              apiKey: config.apiKey || '',
+              defaultModel: config.defaultModel || ''
+            };
+          });
+          renderApp();
+        }
+      } catch (e) {
+        console.log('Running in demo mode - no backend');
+      }
+    }
+
+    function App() {
+      return (
+        <div class="container mx-auto px-4 py-8 max-w-6xl">
+          <header class="text-center mb-12">
+            <h1 class="text-4xl font-bold text-white mb-2">🤖 Agent Auth</h1>
+            <p class="text-gray-400">Universal OAuth Authenticator for AI Agents</p>
+          </header>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {state.providers.map(provider => (
+              <ProviderCard provider={provider} />
+            ))}
+          </div>
+
+          {state.showAuthModal && <AuthModal />}
+          {state.showModelModal && <ModelModal />}
+        </div>
+      );
+    }
+
+    function ProviderCard({ provider }) {
+      return (
+        <div class={`provider-card rounded-xl p-6 ${provider.connected ? 'status-connected' : 'status-disconnected'} shadow-lg`}>
+          <div class="flex items-start justify-between mb-4">
+            <div class="text-4xl">{provider.icon}</div>
+            <span class={`px-3 py-1 rounded-full text-xs font-semibold ${provider.connected ? 'bg-green-500/20 text-green-300' : 'bg-gray-500/20 text-gray-300'}`}>
+              {provider.connected ? '✓ Connected' : '○ Not Connected'}
+            </span>
+          </div>
+          
+          <h3 class="text-xl font-bold text-white mb-2">{provider.name}</h3>
+          <p class="text-sm text-gray-300 mb-4">{provider.description}</p>
+          
+          {provider.connected && provider.defaultModel && (
+            <div class="mb-4 p-3 bg-black/20 rounded-lg">
+              <p class="text-xs text-gray-400">Default Model</p>
+              <p class="text-sm font-mono text-white truncate">{provider.defaultModel}</p>
+            </div>
+          )}
+          
+          <div class="flex gap-2">
+            <button 
+              class="flex-1 btn btn-sm btn-primary"
+              onClick={() => openAuth(provider)}
+            >
+              {provider.connected ? 'Re-authenticate' : 'Connect'}
+            </button>
+            {provider.connected && (
+              <button 
+                class="flex-1 btn btn-sm btn-secondary"
+                onClick={() => openModelSelector(provider)}
+              >
+                Set Model
+              </button>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function AuthModal() {
+      const provider = state.selectedProvider;
+      if (!provider) return null;
+
+      return (
+        <div class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={() => state.showAuthModal = false}>
+          <div class="bg-gray-800 rounded-2xl p-8 max-w-md w-full mx-4 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div class="flex justify-between items-center mb-6">
+              <h2 class="text-2xl font-bold text-white">Connect {provider.name}</h2>
+              <button class="text-gray-400 hover:text-white text-2xl" onClick={() => state.showAuthModal = false}>×</button>
+            </div>
+            
+            <div class="mb-6">
+              <p class="text-gray-300 mb-4">{provider.description}</p>
+              <p class="text-sm text-gray-400 mb-4">
+                Authentication type: <span class="text-white font-semibold">{provider.authType === 'oauth' ? 'OAuth 2.0' : 'API Key'}</span>
+              </p>
+            </div>
+
+            <div class="space-y-4">
+              <div>
+                <label class="block text-sm text-gray-300 mb-2">
+                  {provider.authType === 'oauth' ? 'OAuth Token / Authorization Code' : 'API Key'}
+                </label>
+                <input 
+                  type="password" 
+                  class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-purple-500"
+                  placeholder={provider.authType === 'oauth' ? 'Paste your OAuth token here' : 'sk-...'}
+                  value={provider.apiKey || ''}
+                  onInput={(e) => {
+                    const idx = state.providers.findIndex(p => p.id === provider.id);
+                    if (idx !== -1) state.providers[idx].apiKey = e.target.value;
+                  }}
+                />
+              </div>
+              
+              <a 
+                href={provider.authUrl} 
+                target="_blank" 
+                class="block text-center text-purple-400 hover:text-purple-300 text-sm"
+              >
+                Get {provider.name} credentials →
+              </a>
+            </div>
+
+            <div class="flex gap-3 mt-6">
+              <button 
+                class="flex-1 btn btn-secondary"
+                onClick={() => state.showAuthModal = false}
+              >
+                Cancel
+              </button>
+              <button 
+                class="flex-1 btn btn-primary"
+                onClick={() => saveAuth(provider)}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function ModelModal() {
+      const provider = state.selectedProvider;
+      if (!provider) return null;
+
+      return (
+        <div class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" onClick={() => state.showModelModal = false}>
+          <div class="bg-gray-800 rounded-2xl p-8 max-w-md w-full mx-4 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div class="flex justify-between items-center mb-6">
+              <h2 class="text-2xl font-bold text-white">Select Model</h2>
+              <button class="text-gray-400 hover:text-white text-2xl" onClick={() => state.showModelModal = false}>×</button>
+            </div>
+            
+            <p class="text-gray-300 mb-4">Choose the default model for {provider.name}</p>
+
+            <div class="space-y-2 max-h-64 overflow-y-auto">
+              {provider.models.map(model => (
+                <label 
+                  key={model}
+                  class={`flex items-center p-3 rounded-lg cursor-pointer transition ${
+                    provider.defaultModel === model 
+                      ? 'bg-purple-600/30 border border-purple-500' 
+                      : 'bg-gray-700/50 hover:bg-gray-700 border border-transparent'
+                  }`}
+                >
+                  <input 
+                    type="radio" 
+                    name="model" 
+                    value={model}
+                    checked={provider.defaultModel === model}
+                    onChange={() => {
+                      const idx = state.providers.findIndex(p => p.id === provider.id);
+                      if (idx !== -1) state.providers[idx].defaultModel = model;
+                      renderApp();
+                    }}
+                    class="sr-only"
+                  />
+                  <span class="flex-1 text-white font-mono text-sm">{model}</span>
+                  {provider.defaultModel === model && (
+                    <span class="text-purple-400">✓</span>
+                  )}
+                </label>
+              ))}
+            </div>
+
+            <button 
+              class="w-full btn btn-primary mt-6"
+              onClick={() => state.showModelModal = false}
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    function openAuth(provider) {
+      state.selectedProvider = provider;
+      state.showAuthModal = true;
+      renderApp();
+    }
+
+    function openModelSelector(provider) {
+      state.selectedProvider = provider;
+      state.showModelModal = true;
+      renderApp();
+    }
+
+    async function saveAuth(provider) {
+      const apiKey = provider.apiKey;
+      if (!apiKey) {
+        alert('Please enter an API key or token');
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/save-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            providerId: provider.id,
+            apiKey: apiKey,
+            defaultModel: provider.defaultModel || provider.models[0]
+          })
+        });
+
+        if (response.ok) {
+          const idx = state.providers.findIndex(p => p.id === provider.id);
+          if (idx !== -1) {
+            state.providers[idx].connected = true;
+            if (!state.providers[idx].defaultModel) {
+              state.providers[idx].defaultModel = provider.models[0];
+            }
+          }
+          state.showAuthModal = false;
+          renderApp();
+        }
+      } catch (e) {
+        const idx = state.providers.findIndex(p => p.id === provider.id);
+        if (idx !== -1) {
+          state.providers[idx].connected = true;
+          if (!state.providers[idx].defaultModel) {
+            state.providers[idx].defaultModel = provider.models[0];
+          }
+        }
+        state.showAuthModal = false;
+        state.statusMessage = `Demo: Would save config for ${provider.name}`;
+        renderApp();
+        setTimeout(() => { state.statusMessage = ''; renderApp(); }, 3000);
+      }
+    }
+
+    function renderApp() {
+      const container = document.getElementById('app');
+      const vdom = App();
+      webjsx.applyDiff(container, vdom);
+    }
+
+    renderApp();
+    loadConfigs();
+  </script>
+</body>
+</html>
