@@ -158,7 +158,11 @@
       loading: false,
       statusMessage: '',
       googleOAuthPending: false,
-      googleOAuthError: ''
+      googleOAuthError: '',
+      showOAuthPasteModal: false,
+      oauthPasteUrl: '',
+      oauthPasteError: '',
+      oauthPasteSubmitting: false
     };
 
     async function loadConfigs() {
@@ -199,6 +203,7 @@
 
           {state.showAuthModal && <AuthModal />}
           {state.showModelModal && <ModelModal />}
+          {state.showOAuthPasteModal && <OAuthPasteModal />}
         </div>
       );
     }
@@ -386,6 +391,59 @@
       );
     }
 
+    function OAuthPasteModal() {
+      return (
+        <div class="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div class="bg-gray-800 rounded-2xl p-8 max-w-lg w-full mx-4 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div class="flex justify-between items-center mb-4">
+              <h2 class="text-xl font-bold text-white">Complete Google Sign-In</h2>
+              <button class="text-gray-400 hover:text-white text-2xl" onClick={() => { cleanupOAuthPolling(); state.googleOAuthPending = false; closeOAuthPasteModal(); }}>x</button>
+            </div>
+
+            <div class="mb-4 p-4 bg-gray-700/50 rounded-lg space-y-2">
+              <p class="text-sm text-gray-300">1. A Google sign-in page has opened in a new tab.</p>
+              <p class="text-sm text-gray-300">2. Complete the sign-in process with Google.</p>
+              <p class="text-sm text-gray-300">3. After signing in, you will be redirected to a page that <span class="text-yellow-400 font-semibold">may not load</span> (this is expected).</p>
+              <p class="text-sm text-gray-300">4. Copy the <span class="text-white font-semibold">entire URL</span> from the address bar of that page and paste it below.</p>
+            </div>
+
+            <div class="space-y-3">
+              <label class="block text-sm text-gray-300">Paste the redirect URL here:</label>
+              <input
+                type="text"
+                class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm font-mono focus:outline-none focus:border-purple-500"
+                placeholder="http://localhost:8765/oauth2callback?code=..."
+                value={state.oauthPasteUrl}
+                onInput={(e) => { state.oauthPasteUrl = e.target.value; }}
+                onKeyDown={(e) => { if (e.key === 'Enter') submitOAuthPasteUrl(); }}
+              />
+              {state.oauthPasteError && (
+                <p class="text-xs text-red-400">{state.oauthPasteError}</p>
+              )}
+            </div>
+
+            <div class="flex gap-3 mt-6">
+              <button
+                class="flex-1 btn btn-secondary"
+                onClick={() => { cleanupOAuthPolling(); state.googleOAuthPending = false; closeOAuthPasteModal(); }}
+              >
+                Cancel
+              </button>
+              <button
+                class="flex-1 btn btn-primary"
+                onClick={() => submitOAuthPasteUrl()}
+                disabled={state.oauthPasteSubmitting}
+              >
+                {state.oauthPasteSubmitting ? 'Verifying...' : 'Complete Sign-In'}
+              </button>
+            </div>
+
+            <p class="text-xs text-gray-500 mt-4 text-center">If the redirect page loaded successfully, this dialog will close automatically.</p>
+          </div>
+        </div>
+      );
+    }
+
     function openAuth(provider) {
       state.selectedProvider = provider;
       state.showAuthModal = true;
@@ -398,9 +456,28 @@
       renderApp();
     }
 
+    let oauthPollInterval = null;
+    let oauthTimeout = null;
+
+    function cleanupOAuthPolling() {
+      if (oauthPollInterval) { clearInterval(oauthPollInterval); oauthPollInterval = null; }
+      if (oauthTimeout) { clearTimeout(oauthTimeout); oauthTimeout = null; }
+    }
+
+    function closeOAuthPasteModal() {
+      state.showOAuthPasteModal = false;
+      state.oauthPasteUrl = '';
+      state.oauthPasteError = '';
+      state.oauthPasteSubmitting = false;
+      renderApp();
+    }
+
     async function startGoogleOAuth() {
       state.googleOAuthPending = true;
       state.googleOAuthError = '';
+      state.oauthPasteUrl = '';
+      state.oauthPasteError = '';
+      state.oauthPasteSubmitting = false;
       renderApp();
 
       try {
@@ -412,35 +489,76 @@
         const { authUrl } = await response.json();
         window.open(authUrl, '_blank');
 
-        const pollInterval = setInterval(async () => {
+        state.showOAuthPasteModal = true;
+        renderApp();
+
+        cleanupOAuthPolling();
+        oauthPollInterval = setInterval(async () => {
           try {
             const statusRes = await fetch('/api/google-oauth/status');
             const status = await statusRes.json();
             if (status.status === 'success') {
-              clearInterval(pollInterval);
+              cleanupOAuthPolling();
               state.googleOAuthPending = false;
               state.googleOAuthError = '';
+              closeOAuthPasteModal();
               loadConfigs();
             } else if (status.status === 'error') {
-              clearInterval(pollInterval);
+              cleanupOAuthPolling();
               state.googleOAuthPending = false;
               state.googleOAuthError = status.error || 'Authentication failed';
-              renderApp();
+              closeOAuthPasteModal();
             }
           } catch (_) {}
         }, 1500);
 
-        setTimeout(() => {
-          clearInterval(pollInterval);
+        oauthTimeout = setTimeout(() => {
+          cleanupOAuthPolling();
           if (state.googleOAuthPending) {
             state.googleOAuthPending = false;
             state.googleOAuthError = 'Authentication timed out';
-            renderApp();
+            closeOAuthPasteModal();
           }
         }, 5 * 60 * 1000);
       } catch (e) {
         state.googleOAuthPending = false;
         state.googleOAuthError = e.message;
+        state.showOAuthPasteModal = false;
+        renderApp();
+      }
+    }
+
+    async function submitOAuthPasteUrl() {
+      const url = state.oauthPasteUrl.trim();
+      if (!url) {
+        state.oauthPasteError = 'Please paste the URL from the redirected page.';
+        renderApp();
+        return;
+      }
+      state.oauthPasteSubmitting = true;
+      state.oauthPasteError = '';
+      renderApp();
+      try {
+        const res = await fetch('/api/google-oauth/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        const data = await res.json();
+        if (data.success) {
+          cleanupOAuthPolling();
+          state.googleOAuthPending = false;
+          state.googleOAuthError = '';
+          closeOAuthPasteModal();
+          loadConfigs();
+        } else {
+          state.oauthPasteError = data.error || 'Failed to complete authentication.';
+          state.oauthPasteSubmitting = false;
+          renderApp();
+        }
+      } catch (e) {
+        state.oauthPasteError = e.message;
+        state.oauthPasteSubmitting = false;
         renderApp();
       }
     }

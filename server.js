@@ -28,7 +28,6 @@ function getGeminiOAuthCreds() {
     if (idMatch && secretMatch) return { clientId: idMatch[1], clientSecret: secretMatch[1] };
   } catch {}
   try {
-    const { execSync: ex } = require('child_process');
     const npxDirs = fs.readdirSync(path.join(os.homedir(), '.npm', '_npx')).filter(d => !d.startsWith('.'));
     for (const d of npxDirs) {
       const oauth2Path = path.join(os.homedir(), '.npm', '_npx', d, 'node_modules', '@google', 'gemini-cli-core', 'dist', 'src', 'code_assist', 'oauth2.js');
@@ -231,9 +230,7 @@ function saveConfig(providerId, apiKey, defaultModel) {
     if (fs.existsSync(configPath)) {
       existing = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     }
-  } catch (_) {
-    // corrupt file, start fresh
-  }
+  } catch (_) {}
 
   const newData = config.configFormat(apiKey, defaultModel);
   const merged = { ...existing, ...newData };
@@ -298,30 +295,12 @@ async function saveGeminiCredentials(tokens, email) {
   fs.writeFileSync(GEMINI_ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), { mode: 0o600 });
 }
 
-function buildBaseUrl(req) {
-  const override = process.env.AGENTAUTH_BASE_URL;
-  if (override) return override.replace(/\/+$/, '');
 
-  const fwdProto = req.headers['x-forwarded-proto'];
-  const fwdHost = req.headers['x-forwarded-host'] || req.headers['host'];
-  if (fwdHost) {
-    const proto = fwdProto || (req.socket.encrypted ? 'https' : 'http');
-    const cleanHost = fwdHost
-      .replace(/:443$/, '')
-      .replace(/:80$/, '');
-    const base = `${proto}://${cleanHost}`;
-    console.log(`buildBaseUrl: proto=${proto} fwdHost=${fwdHost} -> ${base}`);
-    return base;
-  }
-  console.log(`buildBaseUrl: no forwarded headers, falling back to http://127.0.0.1:${PORT}`);
-  return `http://127.0.0.1:${PORT}`;
-}
-
-async function startGoogleOAuth(baseUrl) {
+async function startGoogleOAuth() {
   const creds = getGeminiOAuthCreds();
   if (!creds) throw new Error('Could not find Gemini CLI OAuth credentials. Install gemini CLI first.');
 
-  const redirectUri = `${baseUrl}/oauth2callback`;
+  const redirectUri = `http://localhost:${PORT}/oauth2callback`;
   const state = crypto.randomBytes(32).toString('hex');
 
   const client = new OAuth2Client({
@@ -349,16 +328,55 @@ async function startGoogleOAuth(baseUrl) {
   return authUrl;
 }
 
+async function exchangeOAuthCode(code, state) {
+  if (!googleOAuthPending) throw new Error('No pending OAuth flow. Please start authentication again.');
+
+  const { client, redirectUri, state: expectedState } = googleOAuthPending;
+
+  if (state !== expectedState) {
+    googleOAuthState = { status: 'error', error: 'State mismatch', email: null };
+    googleOAuthPending = null;
+    throw new Error('State mismatch - possible CSRF attack.');
+  }
+
+  if (!code) {
+    googleOAuthState = { status: 'error', error: 'No authorization code received', email: null };
+    googleOAuthPending = null;
+    throw new Error('No authorization code received.');
+  }
+
+  const { tokens } = await client.getToken({ code, redirect_uri: redirectUri });
+  client.setCredentials(tokens);
+
+  let email = '';
+  try {
+    const { token } = await client.getAccessToken();
+    if (token) {
+      const resp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (resp.ok) {
+        const info = await resp.json();
+        email = info.email || '';
+      }
+    }
+  } catch (_) {}
+
+  await saveGeminiCredentials(tokens, email);
+  googleOAuthState = { status: 'success', error: null, email };
+  googleOAuthPending = null;
+
+  return email;
+}
+
 async function handleOAuthCallback(req, res) {
-  const reqUrl = new URL(req.url, buildBaseUrl(req));
+  const reqUrl = new URL(req.url, `http://localhost:${PORT}`);
 
   if (!googleOAuthPending) {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(oauthResultPage('Authentication Failed', 'No pending OAuth flow. Please start authentication again.', false));
     return;
   }
-
-  const { client, redirectUri, state: expectedState } = googleOAuthPending;
 
   try {
     const error = reqUrl.searchParams.get('error');
@@ -371,44 +389,9 @@ async function handleOAuthCallback(req, res) {
       return;
     }
 
-    const returnedState = reqUrl.searchParams.get('state');
-    if (returnedState !== expectedState) {
-      googleOAuthState = { status: 'error', error: 'State mismatch', email: null };
-      googleOAuthPending = null;
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(oauthResultPage('Authentication Failed', 'State mismatch - possible CSRF attack.', false));
-      return;
-    }
-
     const code = reqUrl.searchParams.get('code');
-    if (!code) {
-      googleOAuthState = { status: 'error', error: 'No authorization code received', email: null };
-      googleOAuthPending = null;
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(oauthResultPage('Authentication Failed', 'No authorization code received.', false));
-      return;
-    }
-
-    const { tokens } = await client.getToken({ code, redirect_uri: redirectUri });
-    client.setCredentials(tokens);
-
-    let email = '';
-    try {
-      const { token } = await client.getAccessToken();
-      if (token) {
-        const resp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        if (resp.ok) {
-          const info = await resp.json();
-          email = info.email || '';
-        }
-      }
-    } catch (_) {}
-
-    await saveGeminiCredentials(tokens, email);
-    googleOAuthState = { status: 'success', error: null, email };
-    googleOAuthPending = null;
+    const state = reqUrl.searchParams.get('state');
+    const email = await exchangeOAuthCode(code, state);
 
     res.writeHead(200, { 'Content-Type': 'text/html' });
     res.end(oauthResultPage('Authentication Successful', email ? `Signed in as ${email}` : 'Gemini CLI credentials saved.', true));
@@ -500,8 +483,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.url === '/api/google-oauth/start' && req.method === 'POST') {
       try {
-        const baseUrl = buildBaseUrl(req);
-        const authUrl = await startGoogleOAuth(baseUrl);
+        const authUrl = await startGoogleOAuth();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ authUrl }));
         log(req, 200);
@@ -517,6 +499,53 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(googleOAuthState));
       log(req, 200);
+      return;
+    }
+
+    if (req.url === '/api/google-oauth/complete' && req.method === 'POST') {
+      try {
+        const raw = await readBody(req);
+        const body = JSON.parse(raw);
+        const pastedUrl = (body.url || '').trim();
+        if (!pastedUrl) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'No URL provided' }));
+          log(req, 400);
+          return;
+        }
+
+        let parsed;
+        try { parsed = new URL(pastedUrl); } catch (_) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid URL. Paste the full URL from the browser address bar.' }));
+          log(req, 400);
+          return;
+        }
+
+        const error = parsed.searchParams.get('error');
+        if (error) {
+          const desc = parsed.searchParams.get('error_description') || error;
+          googleOAuthState = { status: 'error', error: desc, email: null };
+          googleOAuthPending = null;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: desc }));
+          log(req, 200);
+          return;
+        }
+
+        const code = parsed.searchParams.get('code');
+        const state = parsed.searchParams.get('state');
+        const email = await exchangeOAuthCode(code, state);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, email }));
+        log(req, 200);
+      } catch (e) {
+        googleOAuthState = { status: 'error', error: e.message, email: null };
+        googleOAuthPending = null;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        log(req, 400);
+      }
       return;
     }
 
