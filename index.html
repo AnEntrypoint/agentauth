@@ -159,7 +159,8 @@
       statusMessage: '',
       googleOAuthPending: false,
       googleOAuthError: '',
-      showOAuthPasteModal: false,
+      showOAuthWaiting: false,
+      showOAuthPasteFallback: false,
       oauthPasteUrl: '',
       oauthPasteError: '',
       oauthPasteSubmitting: false
@@ -203,7 +204,7 @@
 
           {state.showAuthModal && <AuthModal />}
           {state.showModelModal && <ModelModal />}
-          {state.showOAuthPasteModal && <OAuthPasteModal />}
+          {state.showOAuthWaiting && <OAuthWaitingModal />}
         </div>
       );
     }
@@ -391,54 +392,58 @@
       );
     }
 
-    function OAuthPasteModal() {
+    function OAuthWaitingModal() {
+      var dismiss = () => { cleanupOAuthPolling(); state.googleOAuthPending = false; state.showOAuthWaiting = false; state.showOAuthPasteFallback = false; state.oauthPasteUrl = ''; state.oauthPasteError = ''; renderApp(); };
       return (
         <div class="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
           <div class="bg-gray-800 rounded-2xl p-8 max-w-lg w-full mx-4 shadow-2xl" onClick={e => e.stopPropagation()}>
             <div class="flex justify-between items-center mb-4">
-              <h2 class="text-xl font-bold text-white">Complete Google Sign-In</h2>
-              <button class="text-gray-400 hover:text-white text-2xl" onClick={() => { cleanupOAuthPolling(); state.googleOAuthPending = false; closeOAuthPasteModal(); }}>x</button>
+              <h2 class="text-xl font-bold text-white">Google Sign-In</h2>
+              <button class="text-gray-400 hover:text-white text-2xl" onClick={dismiss}>x</button>
             </div>
 
-            <div class="mb-4 p-4 bg-gray-700/50 rounded-lg space-y-2">
-              <p class="text-sm text-gray-300">1. A Google sign-in page has opened in a new tab.</p>
-              <p class="text-sm text-gray-300">2. Complete the sign-in process with Google.</p>
-              <p class="text-sm text-gray-300">3. After signing in, you will be redirected to a page that <span class="text-yellow-400 font-semibold">may not load</span> (this is expected).</p>
-              <p class="text-sm text-gray-300">4. Copy the <span class="text-white font-semibold">entire URL</span> from the address bar of that page and paste it below.</p>
-            </div>
-
-            <div class="space-y-3">
-              <label class="block text-sm text-gray-300">Paste the redirect URL here:</label>
-              <input
-                type="text"
-                class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm font-mono focus:outline-none focus:border-purple-500"
-                placeholder="http://localhost:8765/oauth2callback?code=..."
-                value={state.oauthPasteUrl}
-                onInput={(e) => { state.oauthPasteUrl = e.target.value; }}
-                onKeyDown={(e) => { if (e.key === 'Enter') submitOAuthPasteUrl(); }}
-              />
-              {state.oauthPasteError && (
-                <p class="text-xs text-red-400">{state.oauthPasteError}</p>
-              )}
-            </div>
+            {!state.showOAuthPasteFallback ? (
+              <div class="text-center py-6">
+                <div class="text-4xl mb-4 animate-pulse">&#9203;</div>
+                <p class="text-gray-300 mb-2">Waiting for Google sign-in to complete...</p>
+                <p class="text-sm text-gray-500">Complete the sign-in in the tab that just opened.</p>
+                <p class="text-sm text-gray-500 mt-1">This dialog will close automatically when done.</p>
+              </div>
+            ) : (
+              <div>
+                <div class="mb-4 p-4 bg-gray-700/50 rounded-lg space-y-2">
+                  <p class="text-sm text-gray-300">The automatic relay did not complete. This can happen when accessing the server remotely.</p>
+                  <p class="text-sm text-gray-300">After signing in with Google, you were redirected to a page that <span class="text-yellow-400 font-semibold">may not have loaded</span>.</p>
+                  <p class="text-sm text-gray-300">Copy the <span class="text-white font-semibold">entire URL</span> from that tab's address bar and paste it below.</p>
+                </div>
+                <div class="space-y-3">
+                  <input
+                    type="text"
+                    class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white text-sm font-mono focus:outline-none focus:border-purple-500"
+                    placeholder="http://localhost:8765/oauth2callback?code=..."
+                    value={state.oauthPasteUrl}
+                    onInput={(e) => { state.oauthPasteUrl = e.target.value; }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') submitOAuthPasteUrl(); }}
+                  />
+                  {state.oauthPasteError && (
+                    <p class="text-xs text-red-400">{state.oauthPasteError}</p>
+                  )}
+                </div>
+              </div>
+            )}
 
             <div class="flex gap-3 mt-6">
-              <button
-                class="flex-1 btn btn-secondary"
-                onClick={() => { cleanupOAuthPolling(); state.googleOAuthPending = false; closeOAuthPasteModal(); }}
-              >
-                Cancel
-              </button>
-              <button
-                class="flex-1 btn btn-primary"
-                onClick={() => submitOAuthPasteUrl()}
-                disabled={state.oauthPasteSubmitting}
-              >
-                {state.oauthPasteSubmitting ? 'Verifying...' : 'Complete Sign-In'}
-              </button>
+              <button class="flex-1 btn btn-secondary" onClick={dismiss}>Cancel</button>
+              {state.showOAuthPasteFallback && (
+                <button
+                  class="flex-1 btn btn-primary"
+                  onClick={() => submitOAuthPasteUrl()}
+                  disabled={state.oauthPasteSubmitting}
+                >
+                  {state.oauthPasteSubmitting ? 'Verifying...' : 'Complete Sign-In'}
+                </button>
+              )}
             </div>
-
-            <p class="text-xs text-gray-500 mt-4 text-center">If the redirect page loaded successfully, this dialog will close automatically.</p>
           </div>
         </div>
       );
@@ -458,14 +463,17 @@
 
     let oauthPollInterval = null;
     let oauthTimeout = null;
+    let oauthFallbackTimer = null;
 
     function cleanupOAuthPolling() {
       if (oauthPollInterval) { clearInterval(oauthPollInterval); oauthPollInterval = null; }
       if (oauthTimeout) { clearTimeout(oauthTimeout); oauthTimeout = null; }
+      if (oauthFallbackTimer) { clearTimeout(oauthFallbackTimer); oauthFallbackTimer = null; }
     }
 
-    function closeOAuthPasteModal() {
-      state.showOAuthPasteModal = false;
+    function closeOAuthWaiting() {
+      state.showOAuthWaiting = false;
+      state.showOAuthPasteFallback = false;
       state.oauthPasteUrl = '';
       state.oauthPasteError = '';
       state.oauthPasteSubmitting = false;
@@ -475,6 +483,7 @@
     async function startGoogleOAuth() {
       state.googleOAuthPending = true;
       state.googleOAuthError = '';
+      state.showOAuthPasteFallback = false;
       state.oauthPasteUrl = '';
       state.oauthPasteError = '';
       state.oauthPasteSubmitting = false;
@@ -489,41 +498,48 @@
         const { authUrl } = await response.json();
         window.open(authUrl, '_blank');
 
-        state.showOAuthPasteModal = true;
+        state.showOAuthWaiting = true;
         renderApp();
 
         cleanupOAuthPolling();
         oauthPollInterval = setInterval(async () => {
           try {
             const statusRes = await fetch('/api/google-oauth/status');
-            const status = await statusRes.json();
-            if (status.status === 'success') {
+            const statusData = await statusRes.json();
+            if (statusData.status === 'success') {
               cleanupOAuthPolling();
               state.googleOAuthPending = false;
               state.googleOAuthError = '';
-              closeOAuthPasteModal();
+              closeOAuthWaiting();
               loadConfigs();
-            } else if (status.status === 'error') {
+            } else if (statusData.status === 'error') {
               cleanupOAuthPolling();
               state.googleOAuthPending = false;
-              state.googleOAuthError = status.error || 'Authentication failed';
-              closeOAuthPasteModal();
+              state.googleOAuthError = statusData.error || 'Authentication failed';
+              closeOAuthWaiting();
             }
           } catch (_) {}
         }, 1500);
+
+        oauthFallbackTimer = setTimeout(() => {
+          if (state.googleOAuthPending && state.showOAuthWaiting) {
+            state.showOAuthPasteFallback = true;
+            renderApp();
+          }
+        }, 30000);
 
         oauthTimeout = setTimeout(() => {
           cleanupOAuthPolling();
           if (state.googleOAuthPending) {
             state.googleOAuthPending = false;
             state.googleOAuthError = 'Authentication timed out';
-            closeOAuthPasteModal();
+            closeOAuthWaiting();
           }
         }, 5 * 60 * 1000);
       } catch (e) {
         state.googleOAuthPending = false;
         state.googleOAuthError = e.message;
-        state.showOAuthPasteModal = false;
+        state.showOAuthWaiting = false;
         renderApp();
       }
     }
@@ -549,7 +565,7 @@
           cleanupOAuthPolling();
           state.googleOAuthPending = false;
           state.googleOAuthError = '';
-          closeOAuthPasteModal();
+          closeOAuthWaiting();
           loadConfigs();
         } else {
           state.oauthPasteError = data.error || 'Failed to complete authentication.';
