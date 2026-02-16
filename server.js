@@ -299,12 +299,21 @@ async function saveGeminiCredentials(tokens, email) {
 }
 
 function buildBaseUrl(req) {
+  const override = process.env.AGENTAUTH_BASE_URL;
+  if (override) return override.replace(/\/+$/, '');
+
   const fwdProto = req.headers['x-forwarded-proto'];
   const fwdHost = req.headers['x-forwarded-host'] || req.headers['host'];
   if (fwdHost) {
     const proto = fwdProto || (req.socket.encrypted ? 'https' : 'http');
-    return `${proto}://${fwdHost}`;
+    const cleanHost = fwdHost
+      .replace(/:443$/, '')
+      .replace(/:80$/, '');
+    const base = `${proto}://${cleanHost}`;
+    console.log(`buildBaseUrl: proto=${proto} fwdHost=${fwdHost} -> ${base}`);
+    return base;
   }
+  console.log(`buildBaseUrl: no forwarded headers, falling back to http://127.0.0.1:${PORT}`);
   return `http://127.0.0.1:${PORT}`;
 }
 
