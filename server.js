@@ -2,17 +2,12 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const net = require('net');
 const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 
 const PORT = process.env.PORT || 8765;
 const HOST = process.env.HOST || '127.0.0.1';
 const MAX_BODY = 1024 * 1024;
-const ALLOWED_ORIGINS = new Set([
-  `http://localhost:${PORT}`,
-  `http://127.0.0.1:${PORT}`
-]);
 
 const GEMINI_SCOPES = [
   'https://www.googleapis.com/auth/cloud-platform',
@@ -52,7 +47,7 @@ const GEMINI_OAUTH_FILE = path.join(GEMINI_DIR, 'oauth_creds.json');
 const GEMINI_ACCOUNTS_FILE = path.join(GEMINI_DIR, 'google_accounts.json');
 
 let googleOAuthState = { status: 'idle', error: null, email: null };
-let googleOAuthCallbackServer = null;
+let googleOAuthPending = null;
 
 const PROVIDER_CONFIGS = {
   'anthropic': {
@@ -253,7 +248,7 @@ function getCorsHeaders(req) {
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   };
-  if (ALLOWED_ORIGINS.has(origin)) {
+  if (origin) {
     headers['Access-Control-Allow-Origin'] = origin;
   }
   return headers;
@@ -282,17 +277,6 @@ function readBody(req) {
   });
 }
 
-function getAvailablePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, () => {
-      const port = srv.address().port;
-      srv.close(() => resolve(port));
-    });
-    srv.on('error', reject);
-  });
-}
-
 async function saveGeminiCredentials(tokens, email) {
   if (!fs.existsSync(GEMINI_DIR)) fs.mkdirSync(GEMINI_DIR, { recursive: true });
   fs.writeFileSync(GEMINI_OAUTH_FILE, JSON.stringify(tokens, null, 2), { mode: 0o600 });
@@ -314,17 +298,21 @@ async function saveGeminiCredentials(tokens, email) {
   fs.writeFileSync(GEMINI_ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), { mode: 0o600 });
 }
 
-async function startGoogleOAuth() {
-  if (googleOAuthCallbackServer) {
-    try { googleOAuthCallbackServer.close(); } catch (_) {}
-    googleOAuthCallbackServer = null;
+function buildBaseUrl(req) {
+  const fwdProto = req.headers['x-forwarded-proto'];
+  const fwdHost = req.headers['x-forwarded-host'] || req.headers['host'];
+  if (fwdHost) {
+    const proto = fwdProto || (req.socket.encrypted ? 'https' : 'http');
+    return `${proto}://${fwdHost}`;
   }
+  return `http://127.0.0.1:${PORT}`;
+}
 
+async function startGoogleOAuth(baseUrl) {
   const creds = getGeminiOAuthCreds();
   if (!creds) throw new Error('Could not find Gemini CLI OAuth credentials. Install gemini CLI first.');
 
-  const port = await getAvailablePort();
-  const redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
+  const redirectUri = `${baseUrl}/oauth2callback`;
   const state = crypto.randomBytes(32).toString('hex');
 
   const client = new OAuth2Client({
@@ -339,94 +327,88 @@ async function startGoogleOAuth() {
     state,
   });
 
+  googleOAuthPending = { client, redirectUri, state };
   googleOAuthState = { status: 'pending', error: null, email: null };
 
-  return new Promise((resolve, reject) => {
-    const cbServer = http.createServer(async (req, res) => {
-      try {
-        const reqUrl = new URL(req.url, `http://127.0.0.1:${port}`);
-        if (reqUrl.pathname !== '/oauth2callback') {
-          res.writeHead(404);
-          res.end('Not found');
-          return;
+  setTimeout(() => {
+    if (googleOAuthState.status === 'pending') {
+      googleOAuthState = { status: 'error', error: 'Authentication timed out', email: null };
+      googleOAuthPending = null;
+    }
+  }, 5 * 60 * 1000);
+
+  return authUrl;
+}
+
+async function handleOAuthCallback(req, res) {
+  const reqUrl = new URL(req.url, buildBaseUrl(req));
+
+  if (!googleOAuthPending) {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(oauthResultPage('Authentication Failed', 'No pending OAuth flow. Please start authentication again.', false));
+    return;
+  }
+
+  const { client, redirectUri, state: expectedState } = googleOAuthPending;
+
+  try {
+    const error = reqUrl.searchParams.get('error');
+    if (error) {
+      const desc = reqUrl.searchParams.get('error_description') || error;
+      googleOAuthState = { status: 'error', error: desc, email: null };
+      googleOAuthPending = null;
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(oauthResultPage('Authentication Failed', desc, false));
+      return;
+    }
+
+    const returnedState = reqUrl.searchParams.get('state');
+    if (returnedState !== expectedState) {
+      googleOAuthState = { status: 'error', error: 'State mismatch', email: null };
+      googleOAuthPending = null;
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(oauthResultPage('Authentication Failed', 'State mismatch - possible CSRF attack.', false));
+      return;
+    }
+
+    const code = reqUrl.searchParams.get('code');
+    if (!code) {
+      googleOAuthState = { status: 'error', error: 'No authorization code received', email: null };
+      googleOAuthPending = null;
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(oauthResultPage('Authentication Failed', 'No authorization code received.', false));
+      return;
+    }
+
+    const { tokens } = await client.getToken({ code, redirect_uri: redirectUri });
+    client.setCredentials(tokens);
+
+    let email = '';
+    try {
+      const { token } = await client.getAccessToken();
+      if (token) {
+        const resp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (resp.ok) {
+          const info = await resp.json();
+          email = info.email || '';
         }
-
-        const error = reqUrl.searchParams.get('error');
-        if (error) {
-          const desc = reqUrl.searchParams.get('error_description') || error;
-          googleOAuthState = { status: 'error', error: desc, email: null };
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(oauthResultPage('Authentication Failed', desc, false));
-          cbServer.close();
-          return;
-        }
-
-        const returnedState = reqUrl.searchParams.get('state');
-        if (returnedState !== state) {
-          googleOAuthState = { status: 'error', error: 'State mismatch', email: null };
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(oauthResultPage('Authentication Failed', 'State mismatch - possible CSRF attack.', false));
-          cbServer.close();
-          return;
-        }
-
-        const code = reqUrl.searchParams.get('code');
-        if (!code) {
-          googleOAuthState = { status: 'error', error: 'No authorization code received', email: null };
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(oauthResultPage('Authentication Failed', 'No authorization code received.', false));
-          cbServer.close();
-          return;
-        }
-
-        const { tokens } = await client.getToken({ code, redirect_uri: redirectUri });
-        client.setCredentials(tokens);
-
-        let email = '';
-        try {
-          const { token } = await client.getAccessToken();
-          if (token) {
-            const resp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-              headers: { Authorization: `Bearer ${token}` }
-            });
-            if (resp.ok) {
-              const info = await resp.json();
-              email = info.email || '';
-            }
-          }
-        } catch (_) {}
-
-        await saveGeminiCredentials(tokens, email);
-        googleOAuthState = { status: 'success', error: null, email };
-
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(oauthResultPage('Authentication Successful', email ? `Signed in as ${email}` : 'Gemini CLI credentials saved.', true));
-        cbServer.close();
-      } catch (e) {
-        googleOAuthState = { status: 'error', error: e.message, email: null };
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(oauthResultPage('Authentication Failed', e.message, false));
-        cbServer.close();
       }
-    });
+    } catch (_) {}
 
-    cbServer.on('error', (err) => {
-      googleOAuthState = { status: 'error', error: err.message, email: null };
-      reject(err);
-    });
+    await saveGeminiCredentials(tokens, email);
+    googleOAuthState = { status: 'success', error: null, email };
+    googleOAuthPending = null;
 
-    cbServer.listen(port, '127.0.0.1', () => {
-      googleOAuthCallbackServer = cbServer;
-      resolve(authUrl);
-    });
-
-    setTimeout(() => {
-      if (googleOAuthState.status === 'pending') {
-        googleOAuthState = { status: 'error', error: 'Authentication timed out', email: null };
-        try { cbServer.close(); } catch (_) {}
-      }
-    }, 5 * 60 * 1000);
-  });
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(oauthResultPage('Authentication Successful', email ? `Signed in as ${email}` : 'Gemini CLI credentials saved.', true));
+  } catch (e) {
+    googleOAuthState = { status: 'error', error: e.message, email: null };
+    googleOAuthPending = null;
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(oauthResultPage('Authentication Failed', e.message, false));
+  }
 }
 
 function oauthResultPage(title, message, success) {
@@ -509,7 +491,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.url === '/api/google-oauth/start' && req.method === 'POST') {
       try {
-        const authUrl = await startGoogleOAuth();
+        const baseUrl = buildBaseUrl(req);
+        const authUrl = await startGoogleOAuth(baseUrl);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ authUrl }));
         log(req, 200);
@@ -525,6 +508,20 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(googleOAuthState));
       log(req, 200);
+      return;
+    }
+
+    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (parsedUrl.pathname === '/oauth2callback' && req.method === 'GET') {
+      try {
+        await handleOAuthCallback(req, res);
+        log(req, 200);
+      } catch (e) {
+        console.error('OAuth callback error:', e);
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(oauthResultPage('Authentication Failed', e.message, false));
+        log(req, 500);
+      }
       return;
     }
 
