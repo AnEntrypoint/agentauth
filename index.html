@@ -147,6 +147,16 @@
         models: ['claude-3.5-sonnet', 'gpt-4o', 'gemini-1.5-pro'],
         authType: 'api-key',
         authUrl: 'https://proxypilot.io/'
+      },
+      {
+        id: 'docmcp',
+        name: 'docmcp',
+        icon: '📄',
+        description: 'Google Docs & Sheets MCP',
+        configPaths: ['~/.config/gcloud/docmcp/token.json'],
+        models: [],
+        authType: 'oauth-docmcp',
+        authUrl: 'https://accounts.google.com/'
       }
     ];
 
@@ -159,6 +169,9 @@
       statusMessage: '',
       googleOAuthPending: false,
       googleOAuthError: '',
+      docmcpOAuthPending: false,
+      docmcpOAuthError: '',
+      activeOAuthProvider: null,
       showOAuthWaiting: false,
       showOAuthPasteFallback: false,
       oauthPasteUrl: '',
@@ -233,6 +246,8 @@
 
     function ProviderCard({ provider }) {
       const isGoogleOAuth = provider.id === 'google';
+      const isDocmcpOAuth = provider.id === 'docmcp';
+      const isOAuthProvider = isGoogleOAuth || isDocmcpOAuth;
       const isClaudeMax = provider.id === 'anthropic-claude-code';
       return (
         <div class={`provider-card rounded-xl p-6 ${provider.connected ? 'status-connected' : 'status-disconnected'} shadow-lg`}>
@@ -263,6 +278,12 @@
           {state.googleOAuthError && isGoogleOAuth && (
             <div class="mb-4 p-2 bg-red-900/30 rounded-lg">
               <p class="text-xs text-red-300">{state.googleOAuthError}</p>
+            </div>
+          )}
+
+          {state.docmcpOAuthError && isDocmcpOAuth && (
+            <div class="mb-4 p-2 bg-red-900/30 rounded-lg">
+              <p class="text-xs text-red-300">{state.docmcpOAuthError}</p>
             </div>
           )}
 
@@ -311,6 +332,14 @@
               >
                 {state.googleOAuthPending ? 'Waiting for Google...' : (provider.connected ? 'Re-authenticate' : 'Sign in with Google')}
               </button>
+            ) : isDocmcpOAuth ? (
+              <button
+                class="flex-1 btn btn-sm btn-primary"
+                onClick={() => startDocmcpOAuth()}
+                disabled={state.docmcpOAuthPending}
+              >
+                {state.docmcpOAuthPending ? 'Waiting for Google...' : (provider.connected ? 'Re-authenticate' : 'Sign in with Google')}
+              </button>
             ) : (
               <button
                 class="flex-1 btn btn-sm btn-primary"
@@ -319,7 +348,7 @@
                 {provider.connected ? 'Re-authenticate' : 'Connect'}
               </button>
             )}
-            {provider.connected && !isGoogleOAuth && (
+            {provider.connected && !isOAuthProvider && (
               <button
                 class="flex-1 btn btn-sm btn-secondary"
                 onClick={() => openModelSelector(provider)}
@@ -552,12 +581,14 @@
       state.oauthPasteUrl = '';
       state.oauthPasteError = '';
       state.oauthPasteSubmitting = false;
+      state.activeOAuthProvider = null;
       renderApp();
     }
 
     async function startGoogleOAuth() {
       state.googleOAuthPending = true;
       state.googleOAuthError = '';
+      state.activeOAuthProvider = 'google';
       state.showOAuthPasteFallback = false;
       state.oauthPasteUrl = '';
       state.oauthPasteError = '';
@@ -619,6 +650,71 @@
       }
     }
 
+    async function startDocmcpOAuth() {
+      state.docmcpOAuthPending = true;
+      state.docmcpOAuthError = '';
+      state.activeOAuthProvider = 'docmcp';
+      state.showOAuthPasteFallback = false;
+      state.oauthPasteUrl = '';
+      state.oauthPasteError = '';
+      state.oauthPasteSubmitting = false;
+      renderApp();
+
+      try {
+        const response = await fetch('/api/docmcp-oauth/start', { method: 'POST' });
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.error || 'Failed to start OAuth');
+        }
+        const { authUrl } = await response.json();
+        window.open(authUrl, '_blank');
+
+        state.showOAuthWaiting = true;
+        renderApp();
+
+        cleanupOAuthPolling();
+        oauthPollInterval = setInterval(async () => {
+          try {
+            const statusRes = await fetch('/api/docmcp-oauth/status');
+            const statusData = await statusRes.json();
+            if (statusData.status === 'success') {
+              cleanupOAuthPolling();
+              state.docmcpOAuthPending = false;
+              state.docmcpOAuthError = '';
+              closeOAuthWaiting();
+              loadConfigs();
+            } else if (statusData.status === 'error') {
+              cleanupOAuthPolling();
+              state.docmcpOAuthPending = false;
+              state.docmcpOAuthError = statusData.error || 'Authentication failed';
+              closeOAuthWaiting();
+            }
+          } catch (_) {}
+        }, 1500);
+
+        oauthFallbackTimer = setTimeout(() => {
+          if (state.docmcpOAuthPending && state.showOAuthWaiting) {
+            state.showOAuthPasteFallback = true;
+            renderApp();
+          }
+        }, 30000);
+
+        oauthTimeout = setTimeout(() => {
+          cleanupOAuthPolling();
+          if (state.docmcpOAuthPending) {
+            state.docmcpOAuthPending = false;
+            state.docmcpOAuthError = 'Authentication timed out';
+            closeOAuthWaiting();
+          }
+        }, 5 * 60 * 1000);
+      } catch (e) {
+        state.docmcpOAuthPending = false;
+        state.docmcpOAuthError = e.message;
+        state.showOAuthWaiting = false;
+        renderApp();
+      }
+    }
+
     async function submitOAuthPasteUrl() {
       const url = state.oauthPasteUrl.trim();
       if (!url) {
@@ -629,8 +725,9 @@
       state.oauthPasteSubmitting = true;
       state.oauthPasteError = '';
       renderApp();
+      const endpoint = state.activeOAuthProvider === 'docmcp' ? '/api/docmcp-oauth/complete' : '/api/google-oauth/complete';
       try {
-        const res = await fetch('/api/google-oauth/complete', {
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url })
@@ -638,8 +735,13 @@
         const data = await res.json();
         if (data.success) {
           cleanupOAuthPolling();
-          state.googleOAuthPending = false;
-          state.googleOAuthError = '';
+          if (state.activeOAuthProvider === 'docmcp') {
+            state.docmcpOAuthPending = false;
+            state.docmcpOAuthError = '';
+          } else {
+            state.googleOAuthPending = false;
+            state.googleOAuthError = '';
+          }
           closeOAuthWaiting();
           loadConfigs();
         } else {

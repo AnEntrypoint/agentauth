@@ -15,6 +15,15 @@ const GEMINI_SCOPES = [
   'https://www.googleapis.com/auth/userinfo.profile',
 ];
 
+const DOCMCP_SCOPES = [
+  'https://www.googleapis.com/auth/drive',
+  'https://www.googleapis.com/auth/documents',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/script.projects',
+  'https://www.googleapis.com/auth/userinfo.email',
+  'https://www.googleapis.com/auth/userinfo.profile',
+];
+
 function getGeminiOAuthCreds() {
   if (process.env.GOOGLE_OAUTH_CLIENT_ID && process.env.GOOGLE_OAUTH_CLIENT_SECRET) {
     return { clientId: process.env.GOOGLE_OAUTH_CLIENT_ID, clientSecret: process.env.GOOGLE_OAUTH_CLIENT_SECRET, custom: true };
@@ -60,9 +69,12 @@ function extractOAuthFromFile(oauth2Path) {
 const GEMINI_DIR = path.join(os.homedir(), '.gemini');
 const GEMINI_OAUTH_FILE = path.join(GEMINI_DIR, 'oauth_creds.json');
 const GEMINI_ACCOUNTS_FILE = path.join(GEMINI_DIR, 'google_accounts.json');
+const DOCMCP_TOKEN_FILE = path.join(os.homedir(), '.config', 'gcloud', 'docmcp', 'token.json');
 
 let googleOAuthState = { status: 'idle', error: null, email: null };
 let googleOAuthPending = null;
+let docmcpOAuthState = { status: 'idle', error: null, email: null };
+let docmcpOAuthPending = null;
 
 const PROVIDER_CONFIGS = {
   'anthropic': {
@@ -136,6 +148,19 @@ function getGeminiOAuthStatus() {
   return null;
 }
 
+function getDocmcpOAuthStatus() {
+  try {
+    if (fs.existsSync(DOCMCP_TOKEN_FILE)) {
+      const creds = JSON.parse(fs.readFileSync(DOCMCP_TOKEN_FILE, 'utf8'));
+      if (creds.refresh_token || creds.access_token) {
+        const email = creds.email || '';
+        return { hasKey: true, apiKey: email ? email : '****oauth', defaultModel: '', path: DOCMCP_TOKEN_FILE, authMethod: 'oauth' };
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
 async function fetchClaudeUsage(apiKey) {
   try {
     const response = await fetch('https://api.anthropic.com/v1/usage', {
@@ -174,6 +199,8 @@ function getConfigs() {
       }
     }
   }
+  const docmcpStatus = getDocmcpOAuthStatus();
+  if (docmcpStatus) configs['docmcp'] = docmcpStatus;
   return configs;
 }
 
@@ -226,6 +253,14 @@ async function saveGeminiCredentials(tokens, email) {
     accounts.active = email;
   }
   fs.writeFileSync(GEMINI_ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), { mode: 0o600 });
+}
+
+async function saveDocmcpCredentials(tokens, email) {
+  const dir = path.dirname(DOCMCP_TOKEN_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const creds = { ...tokens, email };
+  fs.writeFileSync(DOCMCP_TOKEN_FILE, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(DOCMCP_TOKEN_FILE, 0o600); } catch (_) {}
 }
 
 function buildBaseUrl(req, customPort) {
@@ -320,6 +355,42 @@ async function exchangeOAuthCode(code, stateParam) {
   await saveGeminiCredentials(tokens, email);
   googleOAuthState = { status: 'success', error: null, email };
   googleOAuthPending = null;
+  return email;
+}
+
+async function exchangeDocmcpOAuthCode(code, stateParam) {
+  if (!docmcpOAuthPending) throw new Error('No pending OAuth flow. Please start authentication again.');
+
+  const { client, redirectUri, state: expectedCsrf } = docmcpOAuthPending;
+  const { csrfToken } = decodeOAuthState(stateParam);
+
+  if (csrfToken !== expectedCsrf) {
+    docmcpOAuthState = { status: 'error', error: 'State mismatch', email: null };
+    docmcpOAuthPending = null;
+    throw new Error('State mismatch - possible CSRF attack.');
+  }
+
+  if (!code) {
+    docmcpOAuthState = { status: 'error', error: 'No authorization code received', email: null };
+    docmcpOAuthPending = null;
+    throw new Error('No authorization code received.');
+  }
+
+  const { tokens } = await client.getToken({ code, redirect_uri: redirectUri });
+  client.setCredentials(tokens);
+
+  let email = '';
+  try {
+    const { token } = await client.getAccessToken();
+    if (token) {
+      const resp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: `Bearer ${token}` } });
+      if (resp.ok) { const info = await resp.json(); email = info.email || ''; }
+    }
+  } catch (_) {}
+
+  await saveDocmcpCredentials(tokens, email);
+  docmcpOAuthState = { status: 'success', error: null, email };
+  docmcpOAuthPending = null;
   return email;
 }
 
@@ -800,6 +871,101 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         googleOAuthState = { status: 'error', error: e.message, email: null };
         googleOAuthPending = null;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        log(req, 400);
+      }
+      return;
+    }
+
+    if (req.url === '/api/docmcp-oauth/start' && req.method === 'POST') {
+      try {
+        const creds = getGeminiOAuthCreds();
+        if (!creds) throw new Error('Could not find OAuth credentials. Install gemini CLI first or set GOOGLE_OAUTH_CLIENT_ID/SECRET.');
+        const redirectUri = `http://localhost:${PORT}/oauth2callback`;
+        const csrfToken = crypto.randomBytes(32).toString('hex');
+        const relayUrl = `${buildBaseUrl(req)}/api/docmcp-oauth/relay`;
+        const state = encodeOAuthState(csrfToken, relayUrl);
+        const client = new OAuth2Client({ clientId: creds.clientId, clientSecret: creds.clientSecret });
+        const authUrl = client.generateAuthUrl({ redirect_uri: redirectUri, access_type: 'offline', scope: DOCMCP_SCOPES, state });
+        docmcpOAuthPending = { client, redirectUri, state: csrfToken };
+        docmcpOAuthState = { status: 'pending', error: null, email: null };
+        setTimeout(() => {
+          if (docmcpOAuthState.status === 'pending') {
+            docmcpOAuthState = { status: 'error', error: 'Authentication timed out', email: null };
+            docmcpOAuthPending = null;
+          }
+        }, 5 * 60 * 1000);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ authUrl }));
+        log(req, 200);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        log(req, 500);
+      }
+      return;
+    }
+
+    if (req.url === '/api/docmcp-oauth/status' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(docmcpOAuthState));
+      log(req, 200);
+      return;
+    }
+
+    if (req.url === '/api/docmcp-oauth/relay' && req.method === 'POST') {
+      try {
+        const body = JSON.parse(await readBody(req));
+        const { code, state: stateParam } = body;
+        if (!code || !stateParam) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing code or state' }));
+          log(req, 400); return;
+        }
+        const email = await exchangeDocmcpOAuthCode(code, stateParam);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, email }));
+        log(req, 200);
+      } catch (e) {
+        docmcpOAuthState = { status: 'error', error: e.message, email: null };
+        docmcpOAuthPending = null;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        log(req, 400);
+      }
+      return;
+    }
+
+    if (req.url === '/api/docmcp-oauth/complete' && req.method === 'POST') {
+      try {
+        const body = JSON.parse(await readBody(req));
+        const pastedUrl = (body.url || '').trim();
+        if (!pastedUrl) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'No URL provided' })); log(req, 400); return; }
+        let parsed;
+        try { parsed = new URL(pastedUrl); } catch (_) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid URL. Paste the full URL from the browser address bar.' }));
+          log(req, 400); return;
+        }
+        const error = parsed.searchParams.get('error');
+        if (error) {
+          const desc = parsed.searchParams.get('error_description') || error;
+          docmcpOAuthState = { status: 'error', error: desc, email: null };
+          docmcpOAuthPending = null;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: desc }));
+          log(req, 200); return;
+        }
+        const code = parsed.searchParams.get('code');
+        const state = parsed.searchParams.get('state');
+        const email = await exchangeDocmcpOAuthCode(code, state);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, email }));
+        log(req, 200);
+      } catch (e) {
+        docmcpOAuthState = { status: 'error', error: e.message, email: null };
+        docmcpOAuthPending = null;
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: e.message }));
         log(req, 400);
