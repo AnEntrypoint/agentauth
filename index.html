@@ -163,7 +163,9 @@
       showOAuthPasteFallback: false,
       oauthPasteUrl: '',
       oauthPasteError: '',
-      oauthPasteSubmitting: false
+      oauthPasteSubmitting: false,
+      claudeUsage: null,
+      claudeUsageLoading: false
     };
 
     async function loadConfigs() {
@@ -182,9 +184,29 @@
             };
           });
           renderApp();
+          // Load Claude usage if Claude Code Max is connected
+          if (configs['anthropic-claude-code']?.hasKey || configs['anthropic']?.hasKey) {
+            loadClaudeUsage();
+          }
         }
       } catch (e) {
         console.log('Running in demo mode - no backend');
+      }
+    }
+
+    async function loadClaudeUsage() {
+      if (state.claudeUsageLoading) return;
+      state.claudeUsageLoading = true;
+      try {
+        const response = await fetch('/api/claude-usage');
+        if (response.ok) {
+          state.claudeUsage = await response.json();
+          renderApp();
+        }
+      } catch (e) {
+        console.log('Failed to load Claude usage:', e);
+      } finally {
+        state.claudeUsageLoading = false;
       }
     }
 
@@ -211,6 +233,7 @@
 
     function ProviderCard({ provider }) {
       const isGoogleOAuth = provider.id === 'google';
+      const isClaudeMax = provider.id === 'anthropic-claude-code';
       return (
         <div class={`provider-card rounded-xl p-6 ${provider.connected ? 'status-connected' : 'status-disconnected'} shadow-lg`}>
           <div class="flex items-start justify-between mb-4">
@@ -243,6 +266,42 @@
             </div>
           )}
 
+          {isClaudeMax && provider.connected && state.claudeUsage && (
+            <div class="mb-4 p-3 bg-black/30 rounded-lg space-y-2">
+              <p class="text-xs text-gray-400 font-semibold">Usage Limits ({state.claudeUsage.plan})</p>
+              
+              <div class="space-y-2">
+                <div>
+                  <div class="flex justify-between text-xs mb-1">
+                    <span class="text-gray-300">5-Hour Window</span>
+                    <span class="text-white font-mono">~{state.claudeUsage.windows.fiveHour.limit} msgs</span>
+                  </div>
+                  <div class="w-full bg-gray-700 rounded-full h-2">
+                    <div class="bg-gradient-to-r from-purple-500 to-pink-500 h-2 rounded-full" style="width: 100%"></div>
+                  </div>
+                  <p class="text-xs text-gray-500 mt-1">Resets: {formatTimeRemaining(state.claudeUsage.windows.fiveHour.resetAt)}</p>
+                </div>
+                
+                <div>
+                  <div class="flex justify-between text-xs mb-1">
+                    <span class="text-gray-300">Weekly Limit</span>
+                    <span class="text-white font-mono">~{state.claudeUsage.windows.weekly.limit} msgs</span>
+                  </div>
+                  <div class="w-full bg-gray-700 rounded-full h-2">
+                    <div class="bg-gradient-to-r from-blue-500 to-cyan-500 h-2 rounded-full" style="width: 100%"></div>
+                  </div>
+                  <p class="text-xs text-gray-500 mt-1">Resets: {formatTimeRemaining(state.claudeUsage.windows.weekly.resetAt)}</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {isClaudeMax && provider.connected && state.claudeUsageLoading && (
+            <div class="mb-4 p-3 bg-black/20 rounded-lg">
+              <p class="text-xs text-gray-400">Loading usage data...</p>
+            </div>
+          )}
+
           <div class="flex gap-2">
             {isGoogleOAuth ? (
               <button
@@ -271,6 +330,22 @@
           </div>
         </div>
       );
+    }
+
+    function formatTimeRemaining(isoString) {
+      const resetTime = new Date(isoString);
+      const now = new Date();
+      const diff = resetTime - now;
+      
+      if (diff <= 0) return 'soon';
+      
+      const hours = Math.floor(diff / (1000 * 60 * 60));
+      const days = Math.floor(hours / 24);
+      
+      if (days > 0) {
+        return `${days}d ${hours % 24}h`;
+      }
+      return `${hours}h`;
     }
 
     function AuthModal() {

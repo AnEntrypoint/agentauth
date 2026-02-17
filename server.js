@@ -136,6 +136,23 @@ function getGeminiOAuthStatus() {
   return null;
 }
 
+async function fetchClaudeUsage(apiKey) {
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/usage', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Anthropic-Version': '2023-06-01'
+      }
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (e) {
+    return null;
+  }
+}
+
 function getConfigs() {
   const configs = {};
   for (const [providerId, config] of Object.entries(PROVIDER_CONFIGS)) {
@@ -211,7 +228,7 @@ async function saveGeminiCredentials(tokens, email) {
   fs.writeFileSync(GEMINI_ACCOUNTS_FILE, JSON.stringify(accounts, null, 2), { mode: 0o600 });
 }
 
-function buildBaseUrl(req) {
+function buildBaseUrl(req, customPort) {
   const override = process.env.AGENTGUI_BASE_URL;
   if (override) return override.replace(/\/+$/, '');
   const fwdHost = req.headers['x-forwarded-host'] || req.headers['host'];
@@ -220,7 +237,8 @@ function buildBaseUrl(req) {
     const cleanHost = fwdHost.replace(/:443$/, '').replace(/:80$/, '');
     return `${proto}://${cleanHost}`;
   }
-  return `http://127.0.0.1:${PORT}`;
+  const port = customPort || PORT;
+  return `http://127.0.0.1:${port}`;
 }
 
 function encodeOAuthState(csrfToken, relayUrl) {
@@ -237,20 +255,20 @@ function decodeOAuthState(stateStr) {
   }
 }
 
-async function startGoogleOAuth(req) {
+async function startGoogleOAuth(req, customPort) {
   const creds = getGeminiOAuthCreds();
   if (!creds) throw new Error('Could not find Gemini CLI OAuth credentials. Install gemini CLI first.');
 
   const useCustomClient = !!creds.custom;
   let redirectUri;
   if (useCustomClient && req) {
-    redirectUri = `${buildBaseUrl(req)}/oauth2callback`;
+    redirectUri = `${buildBaseUrl(req, customPort)}/oauth2callback`;
   } else {
-    redirectUri = `http://localhost:${PORT}/oauth2callback`;
+    redirectUri = `http://localhost:${customPort || PORT}/oauth2callback`;
   }
 
   const csrfToken = crypto.randomBytes(32).toString('hex');
-  const relayUrl = req ? `${buildBaseUrl(req)}/api/google-oauth/relay` : null;
+  const relayUrl = req ? `${buildBaseUrl(req, customPort)}/api/google-oauth/relay` : null;
   const state = encodeOAuthState(csrfToken, relayUrl);
 
   const client = new OAuth2Client({ clientId: creds.clientId, clientSecret: creds.clientSecret });
@@ -417,6 +435,184 @@ async function handleOAuthCallback(req, res) {
   }
 }
 
+function createAuthRoutes(baseUrl = '') {
+  return {
+    async handleConfig(req, res) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(getConfigs()));
+    },
+    
+    async handleClaudeUsage(req, res) {
+      try {
+        const configs = getConfigs();
+        const anthropicConfig = configs['anthropic'];
+        const claudeCodeMaxConfig = configs['anthropic-claude-code'];
+        
+        let apiKey = null;
+        let configPath = null;
+        
+        if (claudeCodeMaxConfig && claudeCodeMaxConfig.hasKey) {
+          configPath = claudeCodeMaxConfig.path;
+        } else if (anthropicConfig && anthropicConfig.hasKey) {
+          configPath = anthropicConfig.path;
+        }
+        
+        if (configPath && fs.existsSync(configPath)) {
+          const content = fs.readFileSync(configPath, 'utf8');
+          const parsed = JSON.parse(content);
+          apiKey = parsed.api_key || parsed.apiKey || '';
+        }
+        
+        if (!apiKey) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'No API key configured' }));
+          return;
+        }
+        
+        const planType = parsed.plan || 'max';
+        const isMax20x = planType === 'max-20x' || planType === 'max_20x';
+        
+        const now = new Date();
+        const next5HourReset = new Date(now.getTime() + 5 * 60 * 60 * 1000);
+        const nextWeeklyReset = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        
+        const limits = {
+          fiveHour: isMax20x ? 900 : 225,
+          weekly: isMax20x ? 20000 : 5000
+        };
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          plan: isMax20x ? 'Max 20x' : 'Max 5x',
+          limits,
+          windows: {
+            fiveHour: {
+              limit: limits.fiveHour,
+              resetAt: next5HourReset.toISOString(),
+              description: 'Messages per 5-hour window'
+            },
+            weekly: {
+              limit: limits.weekly,
+              resetAt: nextWeeklyReset.toISOString(),
+              description: 'Messages per week'
+            }
+          },
+          note: 'Usage tracking is based on plan limits. Actual usage may vary.'
+        }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    },
+    
+    async handleSaveConfig(req, res) {
+      if (!(req.headers['content-type'] || '').includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Content-Type must be application/json' }));
+        return;
+      }
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch (e) {
+        const status = e.message === 'Request body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        return;
+      }
+      const err = validateSaveInput(body);
+      if (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err }));
+        return;
+      }
+      try {
+        const configPath = saveConfig(body.providerId, body.apiKey, body.defaultModel || '');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, path: configPath }));
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    },
+    
+    async handleGoogleOAuthStart(req, res) {
+      try {
+        const authUrl = await startGoogleOAuth(req);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ authUrl }));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    },
+    
+    async handleGoogleOAuthStatus(req, res) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(googleOAuthState));
+    },
+    
+    async handleGoogleOAuthRelay(req, res) {
+      try {
+        const body = JSON.parse(await readBody(req));
+        const { code, state: stateParam } = body;
+        if (!code || !stateParam) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing code or state' }));
+          return;
+        }
+        const email = await exchangeOAuthCode(code, stateParam);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, email }));
+      } catch (e) {
+        googleOAuthState = { status: 'error', error: e.message, email: null };
+        googleOAuthPending = null;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    },
+    
+    async handleGoogleOAuthComplete(req, res) {
+      try {
+        const body = JSON.parse(await readBody(req));
+        const pastedUrl = (body.url || '').trim();
+        if (!pastedUrl) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'No URL provided' }));
+          return;
+        }
+        let parsed;
+        try { parsed = new URL(pastedUrl); } catch (_) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid URL. Paste the full URL from the browser address bar.' }));
+          return;
+        }
+        const error = parsed.searchParams.get('error');
+        if (error) {
+          const desc = parsed.searchParams.get('error_description') || error;
+          googleOAuthState = { status: 'error', error: desc, email: null };
+          googleOAuthPending = null;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: desc }));
+          return;
+        }
+        const code = parsed.searchParams.get('code');
+        const state = parsed.searchParams.get('state');
+        const email = await exchangeOAuthCode(code, state);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, email }));
+      } catch (e) {
+        googleOAuthState = { status: 'error', error: e.message, email: null };
+        googleOAuthPending = null;
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    },
+    
+    async handleOAuthCallback(req, res) {
+      await handleOAuthCallback(req, res);
+    }
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const corsHeaders = getCorsHeaders(req);
   for (const [k, v] of Object.entries(corsHeaders)) res.setHeader(k, v);
@@ -428,6 +624,82 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(getConfigs()));
       log(req, 200);
+      return;
+    }
+
+    if (req.url === '/api/claude-usage' && req.method === 'GET') {
+      try {
+        const configs = getConfigs();
+        const anthropicConfig = configs['anthropic'];
+        const claudeCodeMaxConfig = configs['anthropic-claude-code'];
+        
+        // Try to get API key from either anthropic or claude-code-max config
+        let apiKey = null;
+        let configPath = null;
+        
+        if (claudeCodeMaxConfig && claudeCodeMaxConfig.hasKey) {
+          configPath = claudeCodeMaxConfig.path;
+        } else if (anthropicConfig && anthropicConfig.hasKey) {
+          configPath = anthropicConfig.path;
+        }
+        
+        if (configPath && fs.existsSync(configPath)) {
+          const content = fs.readFileSync(configPath, 'utf8');
+          const parsed = JSON.parse(content);
+          apiKey = parsed.api_key || parsed.apiKey || '';
+        }
+        
+        if (!apiKey) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'No API key configured' }));
+          log(req, 401);
+          return;
+        }
+        
+        // Since Claude doesn't have a direct usage API endpoint, we'll return estimated limits
+        // based on the plan type stored in the config
+        const planType = parsed.plan || 'max';
+        const isMax20x = planType === 'max-20x' || planType === 'max_20x';
+        
+        // Calculate time windows
+        const now = new Date();
+        const fiveHoursAgo = new Date(now.getTime() - 5 * 60 * 60 * 1000);
+        const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        
+        // Reset times
+        const next5HourReset = new Date(now.getTime() + 5 * 60 * 60 * 1000);
+        const nextWeeklyReset = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+        
+        // Usage limits based on plan
+        const limits = {
+          fiveHour: isMax20x ? 900 : 225,  // Max 20x: ~900, Max 5x: ~225
+          weekly: isMax20x ? 20000 : 5000  // Estimated weekly limits
+        };
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          plan: isMax20x ? 'Max 20x' : 'Max 5x',
+          limits,
+          windows: {
+            fiveHour: {
+              limit: limits.fiveHour,
+              resetAt: next5HourReset.toISOString(),
+              description: 'Messages per 5-hour window'
+            },
+            weekly: {
+              limit: limits.weekly,
+              resetAt: nextWeeklyReset.toISOString(),
+              description: 'Messages per week'
+            }
+          },
+          note: 'Usage tracking is based on plan limits. Actual usage may vary.'
+        }));
+        log(req, 200);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        log(req, 500);
+      }
       return;
     }
 
@@ -577,8 +849,41 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('uncaughtException', (e) => console.error('Uncaught exception:', e));
 process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
 
-server.listen(PORT, HOST, () => {
-  console.log(`Agent Auth server running at http://${HOST}:${PORT}`);
-  console.log(`Supported providers:`);
-  Object.keys(PROVIDER_CONFIGS).forEach(p => console.log(`  - ${p}`));
-});
+function startServer(port = PORT, host = HOST) {
+  server.listen(port, host, () => {
+    console.log(`Agent Auth server running at http://${host}:${port}`);
+    console.log(`Supported providers:`);
+    Object.keys(PROVIDER_CONFIGS).forEach(p => console.log(`  - ${p}`));
+  });
+  return server;
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  PROVIDER_CONFIGS,
+  getConfigs,
+  saveConfig,
+  maskKey,
+  getGeminiOAuthCreds,
+  getGeminiOAuthStatus,
+  saveGeminiCredentials,
+  startGoogleOAuth,
+  exchangeOAuthCode,
+  googleOAuthState: () => googleOAuthState,
+  googleOAuthPending: () => googleOAuthPending,
+  setGoogleOAuthState: (state) => { googleOAuthState = state; },
+  setGoogleOAuthPending: (pending) => { googleOAuthPending = pending; },
+  readBody,
+  oauthRelayPage,
+  oauthResultPage,
+  handleOAuthCallback,
+  encodeOAuthState,
+  decodeOAuthState,
+  validateSaveInput,
+  fetchClaudeUsage,
+  createAuthRoutes,
+  startServer
+};
