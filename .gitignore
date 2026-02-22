@@ -6,3 +6,5 @@ node_modules/
 Thumbs.db
 .glootie-stop-verified
 .prd
+
+.code-search/
