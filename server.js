@@ -112,6 +112,10 @@ const PROVIDER_CONFIGS = {
   'proxypilot': {
     configPaths: [path.join(os.homedir(), '.proxypilot', 'config.json'), path.join(os.homedir(), '.config', 'proxypilot', 'config.json')],
     configFormat: (apiKey, model) => ({ api_key: apiKey, default_model: model })
+  },
+  'codex': {
+    configPaths: [path.join(os.homedir(), '.codex', 'auth.json')],
+    configFormat: (apiKey) => ({ auth_mode: 'apikey', OPENAI_API_KEY: apiKey })
   }
 };
 
@@ -190,7 +194,7 @@ function getConfigs() {
         if (fs.existsSync(configPath)) {
           const content = fs.readFileSync(configPath, 'utf8');
           const parsed = JSON.parse(content);
-          const rawKey = parsed.api_key || parsed.apiKey || parsed.github_token || '';
+          const rawKey = parsed.api_key || parsed.apiKey || parsed.github_token || parsed.OPENAI_API_KEY || '';
           configs[providerId] = { apiKey: maskKey(rawKey), hasKey: !!rawKey, defaultModel: parsed.default_model || parsed.defaultModel || '', path: configPath };
           break;
         }

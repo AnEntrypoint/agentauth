@@ -13,6 +13,7 @@ Universal Credential Manager for AI Agents - a buildless web application using W
 - **Claude Code Max** - Claude Code with Max plan
 - **OpenCode** - OpenCode CLI authentication
 - **ProxyPilot** - ProxyPilot providers
+- **Codex CLI** - OpenAI Codex CLI agent
 
 ## Quick Start
 
@@ -42,6 +43,7 @@ Configs are stored in your home directory:
 - `~/.claude/max.json` - Claude Code Max
 - `~/.opencode/config.json` - OpenCode
 - `~/.proxypilot/config.json` - ProxyPilot
+- `~/.codex/auth.json` - Codex CLI
 
 ## Security
 
