@@ -76,6 +76,96 @@ let googleOAuthPending = null;
 let docmcpOAuthState = { status: 'idle', error: null, email: null };
 let docmcpOAuthPending = null;
 
+const CODEX_AUTH_FILE = path.join(os.homedir(), '.codex', 'auth.json');
+let codexDeviceAuthState = { status: 'idle', error: null, userCode: null, authUrl: null };
+let codexDeviceAuthProcess = null;
+
+function getCodexAuthStatus() {
+  try {
+    if (fs.existsSync(CODEX_AUTH_FILE)) {
+      const creds = JSON.parse(fs.readFileSync(CODEX_AUTH_FILE, 'utf-8'));
+      if (creds.auth_mode === 'oauth' || creds.access_token || creds.refresh_token) {
+        return { authenticated: true, detail: creds.email || 'oauth' };
+      }
+      if (creds.auth_mode === 'apikey' && creds.OPENAI_API_KEY) {
+        return { authenticated: true, detail: 'api-key' };
+      }
+    }
+  } catch (_) {}
+  return { authenticated: false, detail: 'no credentials' };
+}
+
+function startCodexDeviceAuth() {
+  if (codexDeviceAuthProcess) {
+    return { alreadyRunning: true };
+  }
+  const codexStatus = getCodexAuthStatus();
+  if (codexStatus.authenticated) {
+    codexDeviceAuthState = { status: 'success', error: null, userCode: null, authUrl: null };
+    return { alreadyAuthenticated: true };
+  }
+  codexDeviceAuthState = { status: 'pending', error: null, userCode: null, authUrl: null };
+  const { spawn } = require('child_process');
+  const child = spawn('npx', ['@openai/codex', 'login', '--device-auth'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' },
+    shell: os.platform() === 'win32',
+  });
+  codexDeviceAuthProcess = child;
+
+  const onData = (chunk) => {
+    const text = chunk.toString().replace(/\x1b\[[0-9;]*m/g, '');
+    const urlMatch = text.match(/https:\/\/auth\.openai\.com\/codex\/device[^\s]*/);
+    const codeMatch = text.match(/\b([0-9A-Z]{4}-[0-9A-Z]{5})\b/);
+    if (urlMatch && !codexDeviceAuthState.authUrl) codexDeviceAuthState.authUrl = urlMatch[0];
+    if (codeMatch && !codexDeviceAuthState.userCode) codexDeviceAuthState.userCode = codeMatch[1];
+  };
+  child.stdout.on('data', onData);
+  child.stderr.on('data', onData);
+
+  const pollInterval = setInterval(() => {
+    const st = getCodexAuthStatus();
+    if (st.authenticated) {
+      clearInterval(pollInterval);
+      clearTimeout(timeoutId);
+      codexDeviceAuthState = { status: 'success', error: null, userCode: codexDeviceAuthState.userCode, authUrl: codexDeviceAuthState.authUrl };
+      if (codexDeviceAuthProcess) { try { codexDeviceAuthProcess.kill('SIGTERM'); } catch (_) {} codexDeviceAuthProcess = null; }
+    }
+  }, 1500);
+
+  const timeoutId = setTimeout(() => {
+    clearInterval(pollInterval);
+    if (codexDeviceAuthState.status === 'pending') {
+      codexDeviceAuthState = { status: 'error', error: 'Authentication timed out', userCode: null, authUrl: null };
+    }
+    if (codexDeviceAuthProcess) { try { codexDeviceAuthProcess.kill('SIGTERM'); } catch (_) {} codexDeviceAuthProcess = null; }
+  }, 5 * 60 * 1000);
+
+  child.on('error', (e) => {
+    clearInterval(pollInterval);
+    clearTimeout(timeoutId);
+    codexDeviceAuthState = { status: 'error', error: e.message, userCode: null, authUrl: null };
+    codexDeviceAuthProcess = null;
+  });
+  child.on('close', (code) => {
+    clearInterval(pollInterval);
+    clearTimeout(timeoutId);
+    codexDeviceAuthProcess = null;
+    if (codexDeviceAuthState.status === 'pending') {
+      if (code === 0) {
+        const st = getCodexAuthStatus();
+        codexDeviceAuthState = st.authenticated
+          ? { status: 'success', error: null, userCode: codexDeviceAuthState.userCode, authUrl: codexDeviceAuthState.authUrl }
+          : { status: 'error', error: 'Process exited without saving credentials', userCode: null, authUrl: null };
+      } else {
+        codexDeviceAuthState = { status: 'error', error: 'Authentication cancelled', userCode: null, authUrl: null };
+      }
+    }
+  });
+
+  return { started: true };
+}
+
 const PROVIDER_CONFIGS = {
   'anthropic': {
     configPaths: [path.join(os.homedir(), '.claude.json'), path.join(os.homedir(), '.config', 'claude', 'settings.json'), path.join(os.homedir(), '.anthropic.json')],
@@ -879,6 +969,41 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: e.message }));
         log(req, 400);
       }
+      return;
+    }
+
+    if (req.url === '/api/codex-oauth/start' && req.method === 'POST') {
+      try {
+        const result = startCodexDeviceAuth();
+        if (result.alreadyAuthenticated) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'success', authenticated: true }));
+          log(req, 200); return;
+        }
+        const waitForCode = () => new Promise((resolve) => {
+          let tries = 12;
+          const poll = () => {
+            if (codexDeviceAuthState.authUrl || tries-- <= 0) resolve(codexDeviceAuthState);
+            else setTimeout(poll, 400);
+          };
+          poll();
+        });
+        const state = await waitForCode();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: state.status, authUrl: state.authUrl, userCode: state.userCode }));
+        log(req, 200);
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+        log(req, 500);
+      }
+      return;
+    }
+
+    if (req.url === '/api/codex-oauth/status' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(codexDeviceAuthState));
+      log(req, 200);
       return;
     }
 
